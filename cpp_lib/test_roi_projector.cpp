@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include "roi_projector.hpp"
+#include "roi_projector.h"
 
 int main(int argc, char** argv) {
   const std::string calib_path = (argc > 1) ? argv[1] : "test/calib_out.json";

@@ -1,5 +1,5 @@
 // Simple ROI projector library.
-#include "roi_projector.hpp"
+#include "roi_projector.h"
 
 #include <algorithm>
 #include <cctype>
