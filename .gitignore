@@ -16,3 +16,4 @@ dist/
 # 测试输出文件
 test/
 ui_config.json
+transfer_smore_barcode.spec

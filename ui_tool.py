@@ -45,8 +45,8 @@ class CameraCalibrationUI:
         screen_height = root.winfo_screenheight()
         
         # 基准分辨率（设计时的分辨率）
-        base_width = 1920
-        base_height = 1080
+        base_width = 2560
+        base_height = 1440
         
         # 计算缩放比例（取宽度和高度的较小比例，确保窗口不会超出屏幕）
         scale_x = screen_width / base_width
@@ -54,7 +54,7 @@ class CameraCalibrationUI:
         scale = min(scale_x, scale_y, 1.0)  # 不超过1.0，避免窗口过大
         
         # 基准窗口大小
-        base_window_width = 1100
+        base_window_width = 1300
         base_window_height = 1200
         
         # 计算实际窗口大小
