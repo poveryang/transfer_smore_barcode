@@ -15,7 +15,7 @@ class CameraCalibration:
     def __init__(self):
         """初始化标定类"""
         self.extrinsic_matrix = None  # 外参矩阵（4x4齐次变换矩阵）
-        self.calibration_file = "calibration_params.json"
+        self.calibration_file = "transfer_smore_calib.json"
         
         # 标定图像对列表（用于多图像标定）
         self.calibration_image_pairs: List[Tuple[np.ndarray, np.ndarray]] = []

@@ -10,10 +10,21 @@ from PIL import Image, ImageTk
 import time
 import os
 from typing import Optional, Tuple, List
+import paramiko
+import json
 
-from camera_capture import EpicEyeCamera, BarcodeReaderCamera
+from epiceye_camera import EpicEyeCamera
+from smore_camera import SmoreCamera
 from calibration import CameraCalibration
 import epiceye
+
+# 设备参数（用于发送/接收标定配置）
+DEVICE_USERNAME = "smore"
+DEVICE_PORT = 22101
+DEVICE_PASSWORD = "smore123456"
+DEVICE_CONFIG_NAME = "transfer_smore_calib.json"
+DEVICE_BASE_DIR = "/usr/scanner"
+UI_CONFIG_FILE = "ui_config.json"  # UI配置文件名
 
 
 class CameraCalibrationUI:
@@ -28,11 +39,38 @@ class CameraCalibrationUI:
         """
         self.root = root
         self.root.title("相机外参标定工具")
-        self.root.geometry("1100x1200")
+        
+        # 根据屏幕分辨率自动调整窗口大小
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        
+        # 基准分辨率（设计时的分辨率）
+        base_width = 1920
+        base_height = 1080
+        
+        # 计算缩放比例（取宽度和高度的较小比例，确保窗口不会超出屏幕）
+        scale_x = screen_width / base_width
+        scale_y = screen_height / base_height
+        scale = min(scale_x, scale_y, 1.0)  # 不超过1.0，避免窗口过大
+        
+        # 基准窗口大小
+        base_window_width = 1100
+        base_window_height = 1200
+        
+        # 计算实际窗口大小
+        window_width = int(base_window_width * scale)
+        window_height = int(base_window_height * scale)
+        
+        # 计算窗口居中位置
+        x = (screen_width - window_width) // 2
+        y = (screen_height - window_height) // 2
+        
+        # 设置窗口大小和位置
+        self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         
         # 相机对象
         self.camera_3d: Optional[EpicEyeCamera] = None
-        self.camera_barcode: Optional[BarcodeReaderCamera] = None
+        self.camera_barcode: Optional[SmoreCamera] = None
         
         # 标定对象
         self.calibration = CameraCalibration()
@@ -46,17 +84,79 @@ class CameraCalibrationUI:
         self.saved_depth_map: Optional[np.ndarray] = None  # 标定时保存的深度图
         self.transformed_roi: Optional[Tuple[int, int, int, int]] = None  # 转换后的ROI
         
-        # ROI相关
-        self.roi_start: Optional[Tuple[int, int]] = None
-        self.roi_end: Optional[Tuple[int, int]] = None
-        self.current_roi: Optional[Tuple[int, int, int, int]] = None
+        # 四个点选择相关（左上、右上、左下、右下）
+        self.selected_points: List[Optional[Tuple[int, int]]] = [None, None, None, None]  # 四个点：左上、右上、左下、右下
+        self.current_point_index: int = 0  # 当前要选择的点索引（0-3）
+        self.transformed_points: List[Optional[Tuple[float, float]]] = [None, None, None, None]  # 转换后的四个点
         
         
         # 创建UI
         self.create_ui()
         
+        # 加载UI配置（IP地址等）
+        self.load_ui_config()
+        
         # 尝试加载已保存的标定参数
         self.calibration.load_calibration()
+    
+    def load_ui_config(self):
+        """加载UI配置（IP地址等）"""
+        if not os.path.exists(UI_CONFIG_FILE):
+            return
+        
+        try:
+            with open(UI_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                if 'ip_3d' in config:
+                    self.ip_3d_var.set(config['ip_3d'])
+                if 'ip_barcode' in config:
+                    self.ip_barcode_var.set(config['ip_barcode'])
+        except Exception as e:
+            print(f"加载UI配置失败: {e}")
+    
+    def save_ui_config(self):
+        """保存UI配置（IP地址等）"""
+        try:
+            config = {
+                'ip_3d': self.ip_3d_var.get().strip(),
+                'ip_barcode': self.ip_barcode_var.get().strip()
+            }
+            with open(UI_CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"保存UI配置失败: {e}")
+    
+    def _get_depth_from_neighborhood(self, depth_map: np.ndarray, x: int, y: int, search_radius: int = 5) -> float:
+        """
+        从周围区域获取有效深度值（平均值）
+        
+        Args:
+            depth_map: 深度图
+            x, y: 中心点坐标
+            search_radius: 搜索半径（像素）
+            
+        Returns:
+            float: 有效深度值的平均值，如果没有有效值则返回0
+        """
+        h, w = depth_map.shape[:2]
+        
+        # 计算搜索区域边界
+        y_min = max(0, y - search_radius)
+        y_max = min(h, y + search_radius + 1)
+        x_min = max(0, x - search_radius)
+        x_max = min(w, x + search_radius + 1)
+        
+        # 提取周围区域的深度值
+        neighborhood = depth_map[y_min:y_max, x_min:x_max]
+        
+        # 过滤有效深度值（> 0）
+        valid_depths = neighborhood[neighborhood > 0]
+        
+        if len(valid_depths) > 0:
+            # 返回平均值
+            return float(np.mean(valid_depths))
+        else:
+            return 0.0
         
     def create_ui(self):
         """创建UI界面"""
@@ -105,18 +205,24 @@ class CameraCalibrationUI:
         test_frame = ttk.LabelFrame(control_frame, text="测试外参", padding="10")
         test_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        ttk.Label(test_frame, text="在3D相机图像上绘制ROI:").grid(
+        ttk.Label(test_frame, text="在3D相机图像上选择四个点:").grid(
             row=0, column=0, sticky=tk.W, pady=5)
         
-        ttk.Button(test_frame, text="清除ROI", command=self.clear_roi).grid(
-            row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        point_labels_frame = ttk.Frame(test_frame)
+        point_labels_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        self.point_status_label = ttk.Label(point_labels_frame, text="请点击图像选择: 左上角", 
+                                           font=("", 9), foreground="blue")
+        self.point_status_label.grid(row=0, column=0, sticky=tk.W)
+        
+        ttk.Button(test_frame, text="清除所有点", command=self.clear_points).grid(
+            row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         
         # 转换方法选择
         ttk.Label(test_frame, text="转换方法:").grid(
-            row=2, column=0, sticky=tk.W, pady=5)
+            row=3, column=0, sticky=tk.W, pady=5)
         
         method_frame = ttk.Frame(test_frame)
-        method_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+        method_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.transform_method_var = tk.StringVar(value="3D转换")
         
@@ -142,11 +248,11 @@ class CameraCalibrationUI:
         # 提示文字
         ttk.Label(test_frame, text="(无深度图时需输入深度；单应性矩阵用于平面场景，精度较低)", 
                  font=("", 8), foreground="gray").grid(
-            row=4, column=0, sticky=tk.W, pady=2)
+            row=5, column=0, sticky=tk.W, pady=2)
         
         # 深度图控制
         depth_frame = ttk.Frame(test_frame)
-        depth_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=5)
+        depth_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=5)
         
         ttk.Button(depth_frame, text="重新采集深度图", command=self.capture_depth_map).grid(
             row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
@@ -156,7 +262,7 @@ class CameraCalibrationUI:
         self.depth_status_label = depth_status_label
         
         ttk.Button(test_frame, text="测试坐标转换", command=self.test_transform).grid(
-            row=6, column=0, sticky=(tk.W, tk.E), pady=5)
+            row=7, column=0, sticky=(tk.W, tk.E), pady=5)
         
         # 初始化：保持深度输入可用
         self._on_transform_method_changed()
@@ -168,11 +274,27 @@ class CameraCalibrationUI:
         param_frame = ttk.LabelFrame(control_frame, text="标定参数管理", padding="10")
         param_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        ttk.Button(param_frame, text="加载标定参数", command=self.load_calibration).grid(
-            row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(param_frame, text="设备IP:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.device_ip_var = tk.StringVar(value="")
+        ttk.Entry(param_frame, textvariable=self.device_ip_var, width=18).grid(
+            row=0, column=1, sticky=tk.W, pady=5)
+        ttk.Label(param_frame, text=f"端口: {DEVICE_PORT}", font=("", 8), foreground="gray").grid(
+            row=0, column=2, sticky=tk.W, pady=5, padx=(5, 0))
         
-        ttk.Button(param_frame, text="保存标定参数", command=self.save_calibration).grid(
-            row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        param_frame.columnconfigure(0, weight=1)
+        param_frame.columnconfigure(1, weight=1)
+        
+        ttk.Button(param_frame, text="保存到文件", command=self.save_calibration).grid(
+            row=1, column=0, sticky=(tk.W, tk.E), pady=5, padx=(0, 5))
+        
+        ttk.Button(param_frame, text="从文件加载", command=self.load_calibration).grid(
+            row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        
+        ttk.Button(param_frame, text="上传到设备", command=self.send_calibration_to_device).grid(
+            row=2, column=0, sticky=(tk.W, tk.E), pady=5, padx=(0, 5))
+        
+        ttk.Button(param_frame, text="从设备下载", command=self.receive_calibration_from_device).grid(
+            row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
         
         # 日志显示
         status_frame = ttk.LabelFrame(control_frame, text="日志", padding="10")
@@ -219,7 +341,12 @@ class CameraCalibrationUI:
         
         ttk.Label(left_3d_frame, text="IP:").grid(row=0, column=0, sticky=tk.W, padx=(0, 3))
         self.ip_3d_var = tk.StringVar(value="")
-        ttk.Entry(left_3d_frame, textvariable=self.ip_3d_var, width=18).grid(row=0, column=1, sticky=tk.W, padx=(0, 3))
+        ip_3d_entry = ttk.Entry(left_3d_frame, textvariable=self.ip_3d_var, width=18)
+        ip_3d_entry.grid(row=0, column=1, sticky=tk.W, padx=(0, 3))
+        # 绑定事件，当IP地址改变时自动保存（延迟保存，避免频繁写入）
+        self._save_config_timer = None
+        ip_3d_entry.bind("<FocusOut>", lambda e: self.save_ui_config())
+        ip_3d_entry.bind("<Return>", lambda e: self.save_ui_config())
         # ttk.Label(left_3d_frame, text="(可带端口，如 169.254.188.22:5000，留空自动搜索)", font=("", 7), foreground="gray").grid(
         #     row=0, column=2, sticky=tk.W, padx=(0, 5))
         ttk.Button(left_3d_frame, text="连接", command=self.connect_3d_camera, width=8).grid(
@@ -256,9 +383,13 @@ class CameraCalibrationUI:
         
         ttk.Label(left_barcode_frame, text="IP:").grid(row=0, column=0, sticky=tk.W, padx=(0, 3))
         self.ip_barcode_var = tk.StringVar(value="")
-        ttk.Entry(left_barcode_frame, textvariable=self.ip_barcode_var, width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 3))
-        ttk.Label(left_barcode_frame, text="(功能待实现)", font=("", 7), foreground="gray").grid(
-            row=0, column=2, sticky=tk.W, padx=(0, 5))
+        ip_barcode_entry = ttk.Entry(left_barcode_frame, textvariable=self.ip_barcode_var, width=18)
+        ip_barcode_entry.grid(row=0, column=1, sticky=tk.W, padx=(0, 3))
+        # 绑定事件，当IP地址改变时自动保存（延迟保存，避免频繁写入）
+        ip_barcode_entry.bind("<FocusOut>", lambda e: self.save_ui_config())
+        ip_barcode_entry.bind("<Return>", lambda e: self.save_ui_config())
+        # ttk.Label(left_barcode_frame, text="(功能待实现)", font=("", 7), foreground="gray").grid(
+        #     row=0, column=2, sticky=tk.W, padx=(0, 5))
         ttk.Button(left_barcode_frame, text="连接", command=self.connect_barcode_camera, width=8).grid(
             row=0, column=3, padx=(0, 3))
         ttk.Button(left_barcode_frame, text="采集", command=self.capture_barcode_image, width=8).grid(
@@ -305,6 +436,7 @@ class CameraCalibrationUI:
         if self.camera_3d.connect():
             self.log("3D相机连接成功")
             self.ip_3d_var.set(self.camera_3d.ip)
+            self.save_ui_config()  # 保存连接成功后的IP地址
             # 内参已在连接时自动加载（camera_capture.py中）
             camera_matrix, distortion = self.camera_3d.get_intrinsics()
             if camera_matrix is not None:
@@ -324,11 +456,12 @@ class CameraCalibrationUI:
             return
         
         self.log(f"正在连接读码器相机: {ip_barcode}")
-        self.camera_barcode = BarcodeReaderCamera(ip=ip_barcode)
+        self.camera_barcode = SmoreCamera(ip=ip_barcode)
         if self.camera_barcode.connect():
             self.log("读码器相机连接成功")
+            self.save_ui_config()  # 保存连接成功后的IP地址
         else:
-            self.log("读码器相机连接失败（功能待实现）")
+            self.log("读码器相机连接失败")
             self.camera_barcode = None
     
     def load_local_image_3d(self):
@@ -421,40 +554,71 @@ class CameraCalibrationUI:
             self.update_display_barcode()
             self.log(f"读码器相机图像采集成功，尺寸: {img.shape}")
         else:
-            self.log("读码器相机图像采集失败（功能待实现）")
-            messagebox.showerror("错误", "读码器相机图像采集失败（功能待实现）")
+            self.log("读码器相机图像采集失败")
+            messagebox.showerror("错误", "读码器相机图像采集失败")
     
     def update_display_3d(self):
         """更新3D相机图像显示（优化性能）"""
         if self.image_3d is None:
             return
         
-        # 只在需要时创建副本（性能优化）
-        if self.current_roi or (self.roi_start and self.roi_end):
-            # 需要绘制ROI时才创建副本
+        # 检查是否有选中的点需要绘制
+        has_points = any(p is not None for p in self.selected_points)
+        
+        if has_points:
+            # 需要绘制点时创建副本
             display_img = self.image_3d.copy()
             
-            # 根据图像分辨率计算ROI线宽（与分辨率成比例）
+            # 根据图像分辨率计算点大小和线宽（与分辨率成比例）
             h, w = self.image_3d.shape[:2]
             base_width = 1920
             base_height = 1200
             width_ratio = w / base_width
             height_ratio = h / base_height
             resolution_ratio = (width_ratio + height_ratio) / 2
-            base_line_width = 4
+            base_line_width = 4  # 与之前ROI的线宽一致
             line_width = max(2, int(base_line_width * resolution_ratio))
+            point_radius = max(5, int(8 * resolution_ratio))
             
-            # 绘制ROI（使用与分辨率成比例的线宽）
-            if self.current_roi:
-                x, y, w, h = self.current_roi
-                cv2.rectangle(display_img, (x, y), (x + w, y + h), (0, 255, 0), line_width)
-            elif self.roi_start and self.roi_end:
-                cv2.rectangle(display_img, self.roi_start, self.roi_end, (0, 255, 0), line_width)
+            # 定义四个点的颜色和标签（使用英文简写）
+            point_colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]  # 绿、蓝、红、青
+            point_labels = ["TL", "TR", "BL", "BR"]  # Top-Left, Top-Right, Bottom-Left, Bottom-Right
+            
+            # 绘制已选择的点
+            valid_points = []
+            for i, point in enumerate(self.selected_points):
+                if point is not None:
+                    x, y = point
+                    # 绘制点
+                    cv2.circle(display_img, (x, y), point_radius, point_colors[i], -1)
+                    cv2.circle(display_img, (x, y), point_radius + 2, (255, 255, 255), 2)
+                    # 绘制标签
+                    label_pos = (x + point_radius + 5, y - point_radius - 5)
+                    cv2.putText(display_img, point_labels[i], label_pos, 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(display_img, point_labels[i], label_pos, 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, point_colors[i], 1)
+                    valid_points.append((x, y, i))
+            
+            # 如果至少有两个点，绘制连接线（按顺序：左上->右上->右下->左下->左上）
+            if len(valid_points) >= 2:
+                # 按顺序连接点：左上(0) -> 右上(1) -> 右下(3) -> 左下(2) -> 左上(0)
+                point_order = [0, 1, 3, 2]  # 左上、右上、右下、左下
+                points_dict = {i: (x, y) for x, y, i in valid_points}
+                
+                # 绘制连接线
+                for idx in range(len(point_order)):
+                    curr_idx = point_order[idx]
+                    next_idx = point_order[(idx + 1) % len(point_order)]
+                    if curr_idx in points_dict and next_idx in points_dict:
+                        pt1 = points_dict[curr_idx]
+                        pt2 = points_dict[next_idx]
+                        cv2.line(display_img, pt1, pt2, (0, 255, 255), line_width)
             
             self.display_image_3d = display_img
             self._update_canvas(self.canvas_3d, display_img)
         else:
-            # 没有ROI时直接使用原图像，避免不必要的复制
+            # 没有点时直接使用原图像，避免不必要的复制
             self.display_image_3d = self.image_3d
             self._update_canvas(self.canvas_3d, self.image_3d)
     
@@ -613,7 +777,7 @@ class CameraCalibrationUI:
             print(f"更新画布出错: {e}")
     
     def on_canvas_3d_click(self, event):
-        """3D相机画布点击事件"""
+        """3D相机画布点击事件 - 选择四个点"""
         if self.image_3d is None:
             return
         
@@ -632,54 +796,42 @@ class CameraCalibrationUI:
         x = max(0, min(x, img_w - 1))
         y = max(0, min(y, img_h - 1))
         
-        # ROI选择模式
-        self.roi_start = (x, y)
-        self.roi_end = None
-        self.current_roi = None
-    
+        # 选择四个点：左上(0)、右上(1)、左下(2)、右下(3)
+        point_labels = ["左上角", "右上角", "左下角", "右下角"]
+        
+        # 设置当前点
+        self.selected_points[self.current_point_index] = (x, y)
+        self.log(f"已选择{point_labels[self.current_point_index]}: ({x}, {y})")
+        
+        # 移动到下一个点
+        self.current_point_index = (self.current_point_index + 1) % 4
+        
+        # 更新状态标签
+        if all(p is not None for p in self.selected_points):
+            self.point_status_label.config(text="四个点已选择完成", foreground="green")
+        else:
+            next_label = point_labels[self.current_point_index]
+            self.point_status_label.config(text=f"请点击图像选择: {next_label}", foreground="blue")
+        
+        # 更新显示
+        self.update_display_3d()
     
     def on_canvas_3d_drag(self, event):
-        """3D相机画布拖拽事件"""
-        if self.roi_start is None or self.image_3d is None:
-            return
-        
-        # 将画布坐标转换为图像坐标
-        canvas_width = self.canvas_3d.winfo_width()
-        canvas_height = self.canvas_3d.winfo_height()
-        if canvas_width <= 1 or canvas_height <= 1:
-            return
-        
-        img_h, img_w = self.image_3d.shape[:2]
-        scale = min(canvas_width / img_w, canvas_height / img_h)
-        
-        x = int((event.x - canvas_width / 2) / scale + img_w / 2)
-        y = int((event.y - canvas_height / 2) / scale + img_h / 2)
-        
-        x = max(0, min(x, img_w - 1))
-        y = max(0, min(y, img_h - 1))
-        
-        self.roi_end = (x, y)
-        self.update_display_3d()
+        """3D相机画布拖拽事件（不再使用）"""
+        pass
     
     def on_canvas_3d_release(self, event):
-        """3D相机画布释放事件"""
-        if self.roi_start and self.roi_end:
-            x1, y1 = self.roi_start
-            x2, y2 = self.roi_end
-            x = min(x1, x2)
-            y = min(y1, y2)
-            w = abs(x2 - x1)
-            h = abs(y2 - y1)
-            self.current_roi = (x, y, w, h)
-            self.log(f"ROI设置: ({x}, {y}, {w}, {h})")
+        """3D相机画布释放事件（不再使用）"""
+        pass
     
-    def clear_roi(self):
-        """清除ROI"""
-        self.roi_start = None
-        self.roi_end = None
-        self.current_roi = None
+    def clear_points(self):
+        """清除所有选择的点"""
+        self.selected_points = [None, None, None, None]
+        self.current_point_index = 0
+        self.transformed_points = [None, None, None, None]
+        self.point_status_label.config(text="请点击图像选择: 左上角", foreground="blue")
         self.update_display_3d()
-        self.log("ROI已清除")
+        self.log("已清除所有点")
     
     def detect_chessboard(self):
         """检测两个图像中的棋盘格"""
@@ -892,6 +1044,7 @@ class CameraCalibrationUI:
         file_path = filedialog.asksaveasfilename(
             title="保存标定参数",
             defaultextension=".json",
+            initialfile=DEVICE_CONFIG_NAME,
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
         if file_path:
@@ -908,6 +1061,126 @@ class CameraCalibrationUI:
                         self.log(f"深度图保存失败: {e}")
             else:
                 self.log(f"标定参数保存失败: {file_path}")
+
+    def _get_device_ip(self) -> Optional[str]:
+        ip = self.device_ip_var.get().strip()
+        if not ip:
+            messagebox.showwarning("警告", "请输入设备IP地址")
+            return None
+        return ip
+
+    def _get_device_path(self, file_name: str) -> str:
+        return f"{DEVICE_BASE_DIR}/{file_name}"
+
+    def send_calibration_to_device(self):
+        """发送标定参数到设备"""
+        ip = self._get_device_ip()
+        if not ip:
+            return
+        
+        local_path = filedialog.askopenfilename(
+            title="选择要上传的标定文件",
+            initialfile=DEVICE_CONFIG_NAME,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not local_path:
+            return
+        
+        file_name = os.path.basename(local_path)
+        remote_path = self._get_device_path(file_name)
+        if not os.path.exists(local_path):
+            if not self.calibration.is_calibrated():
+                messagebox.showwarning("警告", "本地没有配置文件，且当前未完成标定")
+                return
+            if self.calibration.save_calibration(local_path):
+                self.log(f"已生成配置文件: {local_path}")
+            else:
+                self.log(f"配置文件保存失败: {local_path}")
+                messagebox.showerror("失败", "保存配置文件失败，无法发送到设备")
+                return
+        
+        client = None
+        sftp = None
+        try:
+            self.log(f"正在连接设备: {ip}:{DEVICE_PORT}")
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                ip,
+                port=DEVICE_PORT,
+                username=DEVICE_USERNAME,
+                password=DEVICE_PASSWORD,
+                timeout=10
+            )
+            sftp = client.open_sftp()
+            
+            # 确保目标目录存在
+            try:
+                sftp.stat(DEVICE_BASE_DIR)
+            except Exception:
+                self.log(f"设备路径不存在，尝试创建: {DEVICE_BASE_DIR}")
+                sftp.mkdir(DEVICE_BASE_DIR)
+            
+            sftp.put(local_path, remote_path)
+            self.log(f"配置文件已发送: {remote_path}")
+            messagebox.showinfo("成功", "配置文件已发送到设备")
+        except Exception as e:
+            self.log(f"发送配置文件失败: {e}")
+            messagebox.showerror("失败", f"发送配置文件失败: {e}")
+        finally:
+            if sftp is not None:
+                sftp.close()
+            if client is not None:
+                client.close()
+
+    def receive_calibration_from_device(self):
+        """从设备接收标定参数"""
+        ip = self._get_device_ip()
+        if not ip:
+            return
+        
+        local_path = filedialog.asksaveasfilename(
+            title="保存下载的标定文件",
+            defaultextension=".json",
+            initialfile=DEVICE_CONFIG_NAME,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not local_path:
+            return
+        
+        file_name = os.path.basename(local_path)
+        remote_path = self._get_device_path(file_name)
+        client = None
+        sftp = None
+        try:
+            self.log(f"正在连接设备: {ip}:{DEVICE_PORT}")
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                ip,
+                port=DEVICE_PORT,
+                username=DEVICE_USERNAME,
+                password=DEVICE_PASSWORD,
+                timeout=10
+            )
+            sftp = client.open_sftp()
+            sftp.get(remote_path, local_path)
+            self.log(f"配置文件已接收: {local_path}")
+            
+            if self.calibration.load_calibration(local_path):
+                self.log("标定参数已加载到当前UI")
+            else:
+                self.log("标定参数加载失败")
+            
+            messagebox.showinfo("成功", "已从设备接收配置文件")
+        except Exception as e:
+            self.log(f"接收配置文件失败: {e}")
+            messagebox.showerror("失败", f"接收配置文件失败: {e}")
+        finally:
+            if sftp is not None:
+                sftp.close()
+            if client is not None:
+                client.close()
     
     def show_3d_camera_intrinsics(self):
         """显示3D相机内参"""
@@ -971,8 +1244,9 @@ class CameraCalibrationUI:
             messagebox.showwarning("警告", "请先标定外参")
             return
         
-        if self.current_roi is None:
-            messagebox.showwarning("警告", "请在3D相机图像上绘制ROI")
+        # 检查是否选择了四个点
+        if not all(p is not None for p in self.selected_points):
+            messagebox.showwarning("警告", "请先在3D相机图像上选择四个点（左上、右上、左下、右下）")
             return
         
         # 检查是否有读码器相机图像（无论是从相机采集的还是加载的本地图像）
@@ -1110,38 +1384,41 @@ class CameraCalibrationUI:
                     if depth_map is not None:
                         self.depth_map = depth_map
                         self.log(f"深度图采集成功，尺寸: {depth_map.shape}")
-                        # 如果有深度图，优先使用3D转换方法（更准确，不需要假设平面）
-                        # 但也可以计算ROI区域的平均深度用于平面转换（作为对比）
-                        x, y, w, h = self.current_roi
-                        # 提取ROI区域的深度值
-                        roi_depth = depth_map[y:y+h, x:x+w]
-                        valid_depths = roi_depth[roi_depth > 0]  # 过滤无效深度值
+                        # 如果有深度图，计算四个点的平均深度用于平面转换（作为参考）
+                        valid_depths = []
+                        for point in self.selected_points:
+                            if point is not None:
+                                x, y = point
+                                if 0 <= y < depth_map.shape[0] and 0 <= x < depth_map.shape[1]:
+                                    depth = depth_map[y, x]
+                                    if depth > 0:
+                                        valid_depths.append(depth)
                         if len(valid_depths) > 0:
-                            # 使用ROI区域的平均深度（比单点深度更准确）
+                            # 使用四个点的平均深度（作为参考）
                             plane_depth = float(np.mean(valid_depths))
-                            self.log(f"ROI区域平均深度: {plane_depth:.2f}mm (范围: {np.min(valid_depths):.2f} - {np.max(valid_depths):.2f}mm)")
-                            # 检查深度值的一致性（如果深度值差异很大，说明ROI可能不在一个平面上）
+                            self.log(f"四个点平均深度: {plane_depth:.2f}mm (范围: {np.min(valid_depths):.2f} - {np.max(valid_depths):.2f}mm)")
+                            # 检查深度值的一致性
                             depth_std = np.std(valid_depths)
                             if depth_std > 50:  # 如果标准差超过50mm，说明深度不一致
-                                self.log(f"警告: ROI区域深度差异较大（标准差: {depth_std:.2f}mm），建议使用3D转换方法")
-                                use_planar_transform = False  # 深度不一致时，不使用平面转换
-                            else:
-                                # 深度一致时，可以选择使用平面转换（但默认还是用3D转换，因为更准确）
-                                use_planar_transform = False  # 默认使用3D转换，因为更准确
-                                self.log("深度值一致性良好，但优先使用3D转换方法（更准确）")
+                                self.log(f"警告: 四个点深度差异较大（标准差: {depth_std:.2f}mm），建议使用3D转换方法")
                         else:
-                            self.log(f"ROI区域深度值无效，将使用3D转换方法")
+                            self.log(f"四个点深度值无效，将使用3D转换方法")
                     else:
                         self.log("深度图获取失败，将使用3D转换方法")
                 else:
                     self.log("无法触发拍摄获取深度图，将使用3D转换方法")
             except Exception as e:
                 self.log(f"获取深度图时出错: {e}，将使用3D转换方法")
-        else:
+        elif depth_map is None:
             self.log("3D相机未连接，无法获取深度值，将使用3D转换方法（需要估算深度）")
         
-        # 转换ROI
-        self.log(f"原始ROI: {self.current_roi}")
+        # 转换四个点
+        point_labels = ["TL", "TR", "BL", "BR"]  # Top-Left, Top-Right, Bottom-Left, Bottom-Right
+        point_labels_cn = ["左上", "右上", "左下", "右下"]  # 用于日志显示
+        self.log(f"开始转换四个点:")
+        for i, point in enumerate(self.selected_points):
+            if point is not None:
+                self.log(f"  {point_labels_cn[i]}: {point}")
         
         # 读取UI输入的深度（平面/估计深度）
         ui_plane_depth_str = self.plane_depth_var.get().strip()
@@ -1149,6 +1426,11 @@ class CameraCalibrationUI:
         # 检查用户选择的转换方法
         transform_method = self.transform_method_var.get()
         self.log(f"选择的转换方法: {transform_method}")
+        
+        # 转换四个点
+        transformed_points_list = []
+        use_planar_transform = False
+        plane_depth = None
         
         # 如果用户选择了单应性矩阵转换，检查是否有平面深度值
         if transform_method == "单应性矩阵":
@@ -1173,24 +1455,38 @@ class CameraCalibrationUI:
                 else:
                     self.log("警告: 单应性矩阵转换需要平面深度值，但未输入且无法从深度图获取，将使用3D转换方法")
                     use_planar_transform = False
-        else:
-            # 用户选择了3D转换，不使用平面转换
-            use_planar_transform = False
-            self.log("使用3D转换方法（推荐，更准确）")
         
         if use_planar_transform and plane_depth is not None:
             # 使用2D平面转换（单应性矩阵）
             depth_source = "UI输入" if ui_plane_depth_str else "从相机获取"
             self.log(f"使用2D平面转换（单应性矩阵），平面深度: {plane_depth:.2f}mm（{depth_source}）")
             
-            transformed_roi = self.calibration.transform_roi_planar(
-                self.current_roi,
-                camera1_matrix,
-                camera2_matrix,
-                plane_depth=plane_depth,
-                camera1_distortion=camera1_distortion,
-                camera2_distortion=camera2_distortion
+            # 计算单应性矩阵
+            H = self.calibration.compute_homography_from_extrinsic(
+                camera1_matrix, camera2_matrix, plane_depth
             )
+            if H is None:
+                messagebox.showerror("错误", "计算单应性矩阵失败")
+                return
+            
+            # 转换四个点
+            for i, point in enumerate(self.selected_points):
+                if point is not None:
+                    x, y = point
+                    # 转换为齐次坐标
+                    point_homo = np.array([x, y, 1.0], dtype=np.float32)
+                    # 应用单应性矩阵
+                    transformed_homo = H @ point_homo
+                    if abs(transformed_homo[2]) < 1e-6:
+                        self.log(f"警告: {point_labels_cn[i]}转换后齐次坐标第三分量接近0")
+                        transformed_points_list.append(None)
+                    else:
+                        transformed_point = (transformed_homo[0] / transformed_homo[2], 
+                                           transformed_homo[1] / transformed_homo[2])
+                        transformed_points_list.append(transformed_point)
+                        self.log(f"  {point_labels_cn[i]}: ({x}, {y}) -> ({transformed_point[0]:.2f}, {transformed_point[1]:.2f})")
+                else:
+                    transformed_points_list.append(None)
         else:
             # 使用3D转换（需要深度图）
             if depth_map is None:
@@ -1231,50 +1527,119 @@ class CameraCalibrationUI:
                     return
             
             self.log("使用3D转换方法（基于深度图）")
-            transformed_roi = self.calibration.transform_roi(
-                self.current_roi,
-                camera1_matrix,
-                camera2_matrix,
-                camera1_distortion,
-                camera2_distortion,
-                depth_map=depth_map
-            )
+            # 转换四个点
+            for i, point in enumerate(self.selected_points):
+                if point is not None:
+                    x, y = point
+                    # 获取该点的深度
+                    if 0 <= y < depth_map.shape[0] and 0 <= x < depth_map.shape[1]:
+                        depth = depth_map[y, x]
+                        
+                        # 如果深度无效，尝试使用周围区域的有效深度值
+                        if depth <= 0:
+                            depth = self._get_depth_from_neighborhood(depth_map, x, y, search_radius=5)
+                            if depth > 0:
+                                self.log(f"  {point_labels_cn[i]}: 点({x}, {y})深度无效，使用周围区域平均深度: {depth:.2f}mm")
+                        
+                        if depth > 0:
+                            # 使用3D转换方法
+                            transformed_point = self.calibration.transform_point_with_projectpoints(
+                                np.array([x, y], dtype=np.float32),
+                                camera1_matrix,
+                                camera2_matrix,
+                                camera1_distortion,
+                                camera2_distortion,
+                                depth
+                            )
+                            if transformed_point is not None:
+                                transformed_points_list.append((float(transformed_point[0]), float(transformed_point[1])))
+                                self.log(f"  {point_labels_cn[i]}: ({x}, {y}), 深度={depth:.2f}mm -> ({transformed_point[0]:.2f}, {transformed_point[1]:.2f})")
+                            else:
+                                transformed_points_list.append(None)
+                                self.log(f"  {point_labels_cn[i]}: 转换失败")
+                        else:
+                            transformed_points_list.append(None)
+                            self.log(f"  {point_labels_cn[i]}: 深度值无效 ({depth:.2f}mm)，周围区域也无有效深度值")
+                    else:
+                        transformed_points_list.append(None)
+                        self.log(f"  {point_labels_cn[i]}: 坐标超出深度图范围")
+                else:
+                    transformed_points_list.append(None)
         
-        if transformed_roi is None:
-            error_msg = "坐标转换失败\n\n可能原因：\n1. 深度图无效\n2. ROI超出图像范围\n3. 转换后的点在相机后方\n4. 有效转换点不足（需要至少2个）\n\n请查看终端输出获取详细错误信息"
+        # 检查转换结果
+        valid_transformed_points = [p for p in transformed_points_list if p is not None]
+        if len(valid_transformed_points) < 2:
+            error_msg = "坐标转换失败\n\n可能原因：\n1. 深度图无效\n2. 某些点的深度值无效\n3. 转换后的点在相机后方\n4. 有效转换点不足（需要至少2个）\n\n请查看终端输出获取详细错误信息"
             messagebox.showerror("错误", error_msg)
             self.log("坐标转换失败，请查看终端输出获取详细错误信息")
             return
         
-        self.transformed_roi = transformed_roi
-        self.log(f"转换后的ROI: {transformed_roi}")
+        self.transformed_points = transformed_points_list
+        self.log(f"成功转换了{len(valid_transformed_points)}个点")
         
-        # 在读码器图像上绘制转换后的ROI
+        # 在读码器图像上绘制转换后的四个点和连接线
         img_barcode_display = self.image_barcode.copy()
-        x, y, w, h = transformed_roi
         
-        # 根据图像分辨率计算ROI线宽（与分辨率成比例）
+        # 根据图像分辨率计算点大小和线宽（与分辨率成比例）
         h_img, w_img = self.image_barcode.shape[:2]
         base_width = 1920
         base_height = 1200
         width_ratio = w_img / base_width
         height_ratio = h_img / base_height
         resolution_ratio = (width_ratio + height_ratio) / 2
-        base_line_width = 4
+        base_line_width = 4  # 与之前ROI的线宽一致
         line_width = max(2, int(base_line_width * resolution_ratio))
+        point_radius = max(5, int(8 * resolution_ratio))
         
-        cv2.rectangle(img_barcode_display, (x, y), (x + w, y + h), (0, 255, 0), line_width)
+        # 定义四个点的颜色和标签（使用英文简写）
+        point_colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]  # 绿、蓝、红、青
+        
+        # 绘制转换后的点
+        valid_points_dict = {}
+        for i, transformed_point in enumerate(transformed_points_list):
+            if transformed_point is not None:
+                x, y = int(transformed_point[0]), int(transformed_point[1])
+                # 确保点在图像范围内
+                x = max(0, min(x, w_img - 1))
+                y = max(0, min(y, h_img - 1))
+                # 绘制点
+                cv2.circle(img_barcode_display, (x, y), point_radius, point_colors[i], -1)
+                cv2.circle(img_barcode_display, (x, y), point_radius + 2, (255, 255, 255), 2)
+                # 绘制标签
+                label_pos = (x + point_radius + 5, y - point_radius - 5)
+                cv2.putText(img_barcode_display, point_labels[i], label_pos, 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(img_barcode_display, point_labels[i], label_pos, 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, point_colors[i], 1)
+                valid_points_dict[i] = (x, y)
+        
+        # 绘制连接线（按顺序：左上->右上->右下->左下->左上）
+        if len(valid_points_dict) >= 2:
+            point_order = [0, 1, 3, 2]  # 左上、右上、右下、左下
+            for idx in range(len(point_order)):
+                curr_idx = point_order[idx]
+                next_idx = point_order[(idx + 1) % len(point_order)]
+                if curr_idx in valid_points_dict and next_idx in valid_points_dict:
+                    pt1 = valid_points_dict[curr_idx]
+                    pt2 = valid_points_dict[next_idx]
+                    cv2.line(img_barcode_display, pt1, pt2, (0, 255, 255), line_width)
+        
         self.display_image_barcode = img_barcode_display
         self._update_canvas(self.canvas_barcode, img_barcode_display)
         
-        # 在3D相机图像上保持ROI显示
+        # 在3D相机图像上保持点显示
         self.update_display_3d()
+        
+        # 构建成功消息
+        points_info = "\n".join([
+            f"{point_labels_cn[i]}: {self.selected_points[i]} -> {transformed_points_list[i] if transformed_points_list[i] else '转换失败'}"
+            for i in range(4) if self.selected_points[i] is not None
+        ])
         
         messagebox.showinfo("成功", 
             f"坐标转换成功！\n\n"
-            f"原始ROI (3D相机): {self.current_roi}\n"
-            f"转换后ROI (读码器): {transformed_roi}\n\n"
-            f"转换后的ROI已显示在读码器图像上")
+            f"转换结果:\n{points_info}\n\n"
+            f"转换后的点已显示在读码器图像上")
 
 
 def main():
