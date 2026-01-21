@@ -2,3 +2,4 @@ opencv-python>=4.5.0
 requests>=2.25.0
 numpy>=1.19.0
 Pillow>=8.0.0
+paramiko>=3.0.0
