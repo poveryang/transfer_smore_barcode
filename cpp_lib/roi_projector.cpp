@@ -1,7 +1,6 @@
 // Simple ROI projector library.
 #include "roi_projector.h"
 
-#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -22,7 +21,40 @@ std::string ReadAllText(const std::string& path) {
   return ss.str();
 }
 
+bool IsPointInConvexQuad(const std::array<roi_projector::Point2D, 4>& quad,
+                         const roi_projector::Point2D& p) {
+  constexpr double kEps = 1e-9;
+  int sign = 0;
+  for (size_t i = 0; i < quad.size(); ++i) {
+    const auto& a = quad[i];
+    const auto& b = quad[(i + 1) % quad.size()];
+    const double cross = (b.u - a.u) * (p.v - a.v) - (b.v - a.v) * (p.u - a.u);
+    if (std::fabs(cross) <= kEps) {
+      continue;
+    }
+    const int current_sign = (cross > 0.0) ? 1 : -1;
+    if (sign == 0) {
+      sign = current_sign;
+    } else if (sign != current_sign) {
+      return false;
+    }
+  }
+  return sign != 0;
+}
+
 }  // namespace
+
+bool IsRoiInsideQuad(const std::array<Point2D, 4>& quad, const std::array<Point2D, 4>& barcode) {
+  for (const auto& pt : barcode) {
+    if (!std::isfinite(pt.u) || !std::isfinite(pt.v)) {
+      return false;
+    }
+    if (!IsPointInConvexQuad(quad, pt)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 bool Projector::LoadCalibration(const std::string& file_path) {
   const std::string json = ReadAllText(file_path);
@@ -46,60 +78,31 @@ bool Projector::LoadCalibration(const std::string& file_path) {
   return true;
 }
 
-RoiResult Projector::ProjectRoi(const Roi& roi, double depth) const {
-  RoiResult result;
+CornersResult Projector::ProjectCorners(
+    const std::array<Point3D, 4>& corners) const {
+  CornersResult result;
   if (!has_calibration_) {
     result.message = "calibration not loaded";
     return result;
   }
-  if (depth <= 0.0 || !std::isfinite(depth)) {
-    result.message = "invalid depth";
-    return result;
-  }
 
-  const double x = roi.x;
-  const double y = roi.y;
-  const double w = roi.w;
-  const double h = roi.h;
-
-  const std::array<std::pair<double, double>, 4> corners = {
-      std::make_pair(x, y),
-      std::make_pair(x + w, y),
-      std::make_pair(x + w, y + h),
-      std::make_pair(x, y + h),
-  };
-
-  std::vector<std::pair<double, double>> projected;
-  projected.reserve(4);
-  for (const auto& pt : corners) {
+  for (size_t i = 0; i < corners.size(); ++i) {
+    const Point3D& pt = corners[i];
+    if (pt.z <= 0.0 || !std::isfinite(pt.z)) {
+      result.message = "invalid depth at corner " + std::to_string(i);
+      return result;
+    }
     double out_u = 0.0;
     double out_v = 0.0;
-    if (TransformPoint(pt.first, pt.second, depth, out_u, out_v)) {
-      projected.emplace_back(out_u, out_v);
+    if (!TransformPoint(pt.u, pt.v, pt.z, out_u, out_v)) {
+      result.message = "projection failed at corner " + std::to_string(i);
+      return result;
     }
-  }
-
-  if (projected.size() < 2) {
-    result.message = "not enough valid projected points";
-    return result;
-  }
-
-  double min_x = projected[0].first;
-  double max_x = projected[0].first;
-  double min_y = projected[0].second;
-  double max_y = projected[0].second;
-  for (const auto& pt : projected) {
-    min_x = std::min(min_x, pt.first);
-    max_x = std::max(max_x, pt.first);
-    min_y = std::min(min_y, pt.second);
-    max_y = std::max(max_y, pt.second);
+    result.points[i].u = out_u;
+    result.points[i].v = out_v;
   }
 
   result.ok = true;
-  result.roi.x = min_x;
-  result.roi.y = min_y;
-  result.roi.w = max_x - min_x;
-  result.roi.h = max_y - min_y;
   result.message = "ok";
   return result;
 }

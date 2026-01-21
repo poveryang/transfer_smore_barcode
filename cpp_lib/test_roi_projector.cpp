@@ -4,7 +4,6 @@
 
 int main(int argc, char** argv) {
   const std::string calib_path = (argc > 1) ? argv[1] : "test/calib_out.json";
-  const double depth = (argc > 2) ? std::stod(argv[2]) : 1000.0;
 
   roi_projector::Projector projector;
   if (!projector.LoadCalibration(calib_path)) {
@@ -12,30 +11,34 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  roi_projector::Roi roi;
-  if (argc >= 7) {
-    roi.x = std::stod(argv[3]);
-    roi.y = std::stod(argv[4]);
-    roi.w = std::stod(argv[5]);
-    roi.h = std::stod(argv[6]);
+  std::array<roi_projector::Point3D, 4> corners{};
+  if (argc >= 14) {
+    int arg = 2;
+    for (size_t i = 0; i < corners.size(); ++i) {
+      corners[i].u = std::stod(argv[arg++]);
+      corners[i].v = std::stod(argv[arg++]);
+      corners[i].z = std::stod(argv[arg++]);
+    }
   } else {
-    std::cout << "Usage: roi_projector_test.exe <calib.json> <depth> <x> <y> <w> <h>\n";
-    std::cout << "ROI not provided, using default ROI: (100, 200, 300, 150)\n";
-    roi.x = 100;
-    roi.y = 200;
-    roi.w = 300;
-    roi.h = 150;
+    std::cout << "Usage: roi_projector_test.exe <calib.json> "
+                 "<u1> <v1> <z1> <u2> <v2> <z2> <u3> <v3> <z3> <u4> <v4> <z4>\n";
+    std::cout << "Corners not provided, using default corners.\n";
+    corners[0] = {100.0, 200.0, 1000.0};
+    corners[1] = {400.0, 200.0, 1000.0};
+    corners[2] = {400.0, 350.0, 1000.0};
+    corners[3] = {100.0, 350.0, 1000.0};
   }
 
-  const auto result = projector.ProjectRoi(roi, depth);
+  const auto result = projector.ProjectCorners(corners);
   if (!result.ok) {
-    std::cerr << "Project ROI failed: " << result.message << "\n";
+    std::cerr << "Project corners failed: " << result.message << "\n";
     return 1;
   }
 
-  std::cout << "Projected ROI: x=" << result.roi.x
-            << " y=" << result.roi.y
-            << " w=" << result.roi.w
-            << " h=" << result.roi.h << "\n";
+  std::cout << "Projected corners:\n";
+  for (size_t i = 0; i < result.points.size(); ++i) {
+    std::cout << "  [" << i << "] u=" << result.points[i].u
+              << " v=" << result.points[i].v << "\n";
+  }
   return 0;
 }

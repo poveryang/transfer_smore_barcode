@@ -8,23 +8,36 @@
 
 namespace roi_projector {
 
-struct Roi {
+struct Point2D {
+  double u = 0.0;
+  double v = 0.0;
+};
+
+struct Point3D {
+  double u = 0.0;
+  double v = 0.0;
+  double z = 0.0;
+};
+
+struct Rect {
   double x = 0.0;
   double y = 0.0;
   double w = 0.0;
   double h = 0.0;
 };
 
-struct RoiResult {
+struct CornersResult {
   bool ok = false;
-  Roi roi;
+  std::array<Point2D, 4> points{};
   std::string message;
 };
+
+bool IsRoiInsideQuad(const std::array<Point2D, 4>& quad, const std::array<Point2D, 4>& barcode);
 
 class Projector {
  public:
   bool LoadCalibration(const std::string& file_path);
-  RoiResult ProjectRoi(const Roi& roi, double depth) const;
+  CornersResult ProjectCorners(const std::array<Point3D, 4>& corners) const;
 
  private:
   bool has_calibration_ = false;
