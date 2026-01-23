@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 
 namespace roi_projector {
@@ -42,18 +43,164 @@ bool IsPointInConvexQuad(const std::array<roi_projector::Point2D, 4>& quad,
   return sign != 0;
 }
 
+// 计算多边形面积（使用鞋带公式）
+double ComputePolygonArea(const std::vector<roi_projector::Point2D>& polygon) {
+  if (polygon.size() < 3) {
+    return 0.0;
+  }
+  double area = 0.0;
+  for (size_t i = 0; i < polygon.size(); ++i) {
+    const size_t j = (i + 1) % polygon.size();
+    area += polygon[i].u * polygon[j].v;
+    area -= polygon[j].u * polygon[i].v;
+  }
+  return std::fabs(area) / 2.0;
+}
+
+// 计算线段与半平面的交点
+roi_projector::Point2D ComputeLineIntersection(
+    const roi_projector::Point2D& p1, const roi_projector::Point2D& p2,
+    const roi_projector::Point2D& clip_p1, const roi_projector::Point2D& clip_p2) {
+  const double dx1 = p2.u - p1.u;
+  const double dy1 = p2.v - p1.v;
+  const double dx2 = clip_p2.u - clip_p1.u;
+  const double dy2 = clip_p2.v - clip_p1.v;
+  
+  const double denom = dx1 * dy2 - dy1 * dx2;
+  if (std::fabs(denom) < 1e-9) {
+    // 平行线，返回中点
+    return {(p1.u + p2.u) / 2.0, (p1.v + p2.v) / 2.0};
+  }
+  
+  const double t = ((p1.u - clip_p1.u) * dy2 - (p1.v - clip_p1.v) * dx2) / denom;
+  return {p1.u + t * dx1, p1.v + t * dy1};
+}
+
+// 判断点是否在半平面内（相对于裁剪边）
+bool IsPointInsideHalfPlane(const roi_projector::Point2D& p,
+                            const roi_projector::Point2D& clip_p1,
+                            const roi_projector::Point2D& clip_p2) {
+  const double cross = (clip_p2.u - clip_p1.u) * (p.v - clip_p1.v) -
+                       (clip_p2.v - clip_p1.v) * (p.u - clip_p1.u);
+  return cross >= 0.0;  // 顺时针方向，点在左侧或线上
+}
+
+// 使用 Sutherland-Hodgman 算法计算两个凸多边形的交集
+// 返回 poly1 在 poly2 内部的部分（即 poly1 ∩ poly2）
+std::vector<roi_projector::Point2D> ComputeConvexPolygonIntersection(
+    const std::array<roi_projector::Point2D, 4>& poly1,
+    const std::array<roi_projector::Point2D, 4>& poly2) {
+  std::vector<roi_projector::Point2D> result;
+  // 将 poly1 转换为 vector
+  for (const auto& pt : poly1) {
+    result.push_back(pt);
+  }
+  
+  // 使用 poly2 的每条边作为裁剪边来裁剪 poly1
+  for (size_t i = 0; i < poly2.size(); ++i) {
+    const auto& clip_p1 = poly2[i];
+    const auto& clip_p2 = poly2[(i + 1) % poly2.size()];
+    
+    std::vector<roi_projector::Point2D> new_result;
+    if (result.empty()) {
+      break;
+    }
+    
+    // 处理闭合循环：从最后一个点开始，遍历到第一个点
+    const roi_projector::Point2D* prev = &result.back();
+    bool prev_inside = IsPointInsideHalfPlane(*prev, clip_p1, clip_p2);
+    
+    for (size_t j = 0; j < result.size(); ++j) {
+      const auto& curr = result[j];
+      bool curr_inside = IsPointInsideHalfPlane(curr, clip_p1, clip_p2);
+      
+      if (curr_inside) {
+        if (!prev_inside) {
+          // 从外部进入，添加交点
+          roi_projector::Point2D intersection = ComputeLineIntersection(*prev, curr, clip_p1, clip_p2);
+          new_result.push_back(intersection);
+        }
+        new_result.push_back(curr);
+      } else if (prev_inside) {
+        // 从内部出去，添加交点
+        roi_projector::Point2D intersection = ComputeLineIntersection(*prev, curr, clip_p1, clip_p2);
+        new_result.push_back(intersection);
+      }
+      
+      prev = &curr;
+      prev_inside = curr_inside;
+    }
+    
+    // 如果结果为空，说明没有交集
+    if (new_result.empty()) {
+      std::cout << "[IOU Debug] Clip edge " << i << " resulted in empty intersection" << std::endl << std::flush;
+      return std::vector<roi_projector::Point2D>();
+    }
+    
+    result = std::move(new_result);
+  }
+  
+  return result;
+}
+
+// 计算两个四边形的 IOU（内部实现）
+double ComputeIOUImpl(const std::array<roi_projector::Point2D, 4>& quad,
+                      const std::array<roi_projector::Point2D, 4>& barcode) {
+  // 检查点是否有效
+  for (const auto& pt : quad) {
+    if (!std::isfinite(pt.u) || !std::isfinite(pt.v)) {
+      return 0.0;
+    }
+  }
+  for (const auto& pt : barcode) {
+    if (!std::isfinite(pt.u) || !std::isfinite(pt.v)) {
+      return 0.0;
+    }
+  }
+  
+  // 计算两个四边形的面积
+  std::vector<roi_projector::Point2D> quad_vec(quad.begin(), quad.end());
+  std::vector<roi_projector::Point2D> barcode_vec(barcode.begin(), barcode.end());
+  
+  const double area_quad = ComputePolygonArea(quad_vec);
+  const double area_barcode = ComputePolygonArea(barcode_vec);
+  
+  if (area_quad < 1e-9 || area_barcode < 1e-9) {
+    return 0.0;
+  }
+  
+  // 计算交集面积
+  // ComputeConvexPolygonIntersection(subject, clip) 返回 subject 在 clip 内部的部分
+  // 所以 ComputeConvexPolygonIntersection(barcode, quad) 返回 barcode 在 quad 内的部分
+  // 这就是我们需要的交集：barcode ∩ quad
+  const auto intersection = ComputeConvexPolygonIntersection(barcode, quad);
+  
+  // 调试输出 - 使用cout并立即刷新
+  std::cout << "[IOU Debug] area_quad=" << area_quad << ", area_barcode=" << area_barcode 
+            << ", intersection_size=" << intersection.size();
+  if (intersection.size() > 0) {
+    std::cout << ", first_point=(" << intersection[0].u << "," << intersection[0].v << ")";
+  }
+  std::cout << std::endl << std::flush;
+  
+  const double intersection_area = ComputePolygonArea(intersection);
+  
+  // IOU定义：码区有多少在ROI里面 = 交集面积 / barcode面积
+  if (area_barcode < 1e-9) {
+    return 0.0;
+  }
+  
+  return intersection_area / area_barcode;
+}
+
 }  // namespace
 
 bool IsRoiInsideQuad(const std::array<Point2D, 4>& quad, const std::array<Point2D, 4>& barcode) {
-  for (const auto& pt : barcode) {
-    if (!std::isfinite(pt.u) || !std::isfinite(pt.v)) {
-      return false;
-    }
-    if (!IsPointInConvexQuad(quad, pt)) {
-      return false;
-    }
-  }
-  return true;
+  constexpr double kIOUThreshold = 0.8;
+  const double iou = ComputeIOUImpl(quad, barcode);
+  // 调试输出：打印IOU值 - 使用cout并立即刷新
+  std::cout << "[IOU Debug] IOU: " << iou << std::endl << std::flush;
+  return iou > kIOUThreshold;
 }
 
 bool Projector::LoadCalibration(const std::string& file_path) {
