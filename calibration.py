@@ -106,13 +106,15 @@ class CameraCalibration:
     
     def detect_chessboard(self,
                          image: np.ndarray,
-                         pattern_size: Tuple[int, int]) -> Tuple[bool, Optional[np.ndarray]]:
+                         pattern_size: Tuple[int, int],
+                         use_preprocessing: bool = True) -> Tuple[bool, Optional[np.ndarray]]:
         """
         检测图像中的棋盘格角点
         
         Args:
             image: 输入图像
             pattern_size: 棋盘格内部角点数量 (cols, rows)，例如 (9, 6) 表示9列6行
+            use_preprocessing: 如果初始检测失败，是否尝试预处理方法
             
         Returns:
             Tuple[bool, np.ndarray]: (是否检测成功, 角点坐标)
@@ -123,13 +125,33 @@ class CameraCalibration:
         else:
             gray = image
         
-        # 检测棋盘格角点
-        ret, corners = cv2.findChessboardCorners(
-            gray, pattern_size,
-            flags=cv2.CALIB_CB_ADAPTIVE_THRESH + 
-                  cv2.CALIB_CB_FAST_CHECK + 
-                  cv2.CALIB_CB_NORMALIZE_IMAGE
-        )
+        # 检测标志：移除CALIB_CB_FAST_CHECK，因为它在模糊或低对比度图像上容易失败
+        # 先尝试使用自适应阈值和归一化（不包含快速检查）
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+        
+        ret, corners = cv2.findChessboardCorners(gray, pattern_size, flags=flags)
+        
+        # 如果初始检测失败且允许预处理，尝试预处理方法
+        if not ret and use_preprocessing:
+            preprocessing_methods = [
+                # 方法1: CLAHE (对比度受限的自适应直方图均衡化)
+                lambda img: cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(img),
+                # 方法2: 直方图均衡化
+                lambda img: cv2.equalizeHist(img),
+                # 方法3: 锐化
+                lambda img: cv2.filter2D(img, -1, np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])),
+            ]
+            
+            for i, preprocess_func in enumerate(preprocessing_methods):
+                try:
+                    processed_gray = preprocess_func(gray)
+                    ret, corners = cv2.findChessboardCorners(processed_gray, pattern_size, flags=flags)
+                    if ret:
+                        # 使用预处理后的图像进行亚像素优化
+                        gray = processed_gray
+                        break
+                except Exception:
+                    continue
         
         if ret:
             # 亚像素精度优化
@@ -189,11 +211,13 @@ class CameraCalibration:
         if camera1_matrix is None:
             print("相机1没有内参，先进行单目标定...")
             # 对相机1进行单目标定
+            # 优化：减少迭代次数以加快速度
             ret1, camera1_matrix, dist_coeffs1, rvecs, tvecs = cv2.calibrateCamera(
                 objpoints, imgpoints1,
                 image1.shape[:2][::-1],  # 图像尺寸
                 None, None,
-                flags=cv2.CALIB_FIX_PRINCIPAL_POINT  # 固定主点
+                flags=cv2.CALIB_FIX_PRINCIPAL_POINT,  # 固定主点
+                criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 30, 1e-4)  # 优化迭代次数
             )
             
             if not ret1:
@@ -242,7 +266,8 @@ class CameraCalibration:
                 image2.shape[:2][::-1],  # 图像尺寸 (width, height)
                 camera_matrix_init,  # 提供初始猜测
                 None,
-                flags=cv2.CALIB_USE_INTRINSIC_GUESS  # 使用初始猜测，允许优化
+                flags=cv2.CALIB_USE_INTRINSIC_GUESS,  # 使用初始猜测，允许优化
+                criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 30, 1e-4)  # 优化迭代次数
             )
             
             if not ret2:
@@ -346,6 +371,7 @@ class CameraCalibration:
         flags = cv2.CALIB_FIX_INTRINSIC  # 固定内参，只标定外参
         
         # 使用立体标定计算外参
+        # 优化标定参数以加快速度：减少迭代次数和降低精度要求（仍然保持合理精度）
         try:
             ret, camera1_matrix_new, dist_coeffs1_new, camera2_matrix_new, dist_coeffs2_new, \
             R, T, E, F = cv2.stereoCalibrate(
@@ -354,7 +380,8 @@ class CameraCalibration:
                 camera2_matrix, dist_coeffs2,
                 image1.shape[:2][::-1],  # 图像尺寸 (width, height)
                 flags=flags,
-                criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-5)
+                # 优化：减少迭代次数从100到30，放宽精度要求从1e-5到1e-4，可以显著加快速度
+                criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 30, 1e-4)
             )
             
             if not ret:
@@ -453,7 +480,7 @@ class CameraCalibration:
                 camera2_matrix, dist_coeffs2,
                 image_pairs[0][0].shape[:2][::-1],
                 flags=cv2.CALIB_FIX_INTRINSIC,
-                criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-5)
+                criteria=(cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 30, 1e-4)  # 优化迭代次数
             )
             
             if not ret:

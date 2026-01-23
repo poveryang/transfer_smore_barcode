@@ -12,6 +12,7 @@ import os
 from typing import Optional, Tuple, List
 import paramiko
 import json
+import threading
 
 from epiceye_camera import EpicEyeCamera
 from smore_camera import SmoreCamera
@@ -89,6 +90,13 @@ class CameraCalibrationUI:
         self.current_point_index: int = 0  # 当前要选择的点索引（0-3）
         self.transformed_points: List[Optional[Tuple[float, float]]] = [None, None, None, None]  # 转换后的四个点
         
+        # 标定线程相关
+        self.calibration_thread: Optional[threading.Thread] = None
+        self.calibration_cancel_flag = threading.Event()
+        
+        # 检测线程相关
+        self.detection_thread: Optional[threading.Thread] = None
+        self.detection_cancel_flag = threading.Event()
         
         # 创建UI
         self.create_ui()
@@ -100,7 +108,7 @@ class CameraCalibrationUI:
         self.calibration.load_calibration()
     
     def load_ui_config(self):
-        """加载UI配置（IP地址等）"""
+        """加载UI配置（IP地址、棋盘格参数等）"""
         if not os.path.exists(UI_CONFIG_FILE):
             return
         
@@ -111,15 +119,26 @@ class CameraCalibrationUI:
                     self.ip_3d_var.set(config['ip_3d'])
                 if 'ip_barcode' in config:
                     self.ip_barcode_var.set(config['ip_barcode'])
+                # 加载棋盘格参数
+                if 'pattern_cols' in config:
+                    self.pattern_cols_var.set(str(config['pattern_cols']))
+                if 'pattern_rows' in config:
+                    self.pattern_rows_var.set(str(config['pattern_rows']))
+                if 'square_size' in config:
+                    self.square_size_var.set(str(config['square_size']))
         except Exception as e:
             print(f"加载UI配置失败: {e}")
     
     def save_ui_config(self):
-        """保存UI配置（IP地址等）"""
+        """保存UI配置（IP地址、棋盘格参数等）"""
         try:
             config = {
                 'ip_3d': self.ip_3d_var.get().strip(),
-                'ip_barcode': self.ip_barcode_var.get().strip()
+                'ip_barcode': self.ip_barcode_var.get().strip(),
+                # 保存棋盘格参数
+                'pattern_cols': self.pattern_cols_var.get().strip(),
+                'pattern_rows': self.pattern_rows_var.get().strip(),
+                'square_size': self.square_size_var.get().strip()
             }
             with open(UI_CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
@@ -182,24 +201,61 @@ class CameraCalibrationUI:
         pattern_frame.grid(row=1, column=1, sticky=tk.W, pady=5)
         self.pattern_cols_var = tk.StringVar(value="11")
         self.pattern_rows_var = tk.StringVar(value="8")
-        ttk.Entry(pattern_frame, textvariable=self.pattern_cols_var, width=5).grid(row=0, column=0)
+        pattern_cols_entry = ttk.Entry(pattern_frame, textvariable=self.pattern_cols_var, width=5)
+        pattern_cols_entry.grid(row=0, column=0)
+        pattern_cols_entry.bind("<FocusOut>", lambda e: self.save_ui_config())
+        pattern_cols_entry.bind("<Return>", lambda e: self.save_ui_config())
+        
         ttk.Label(pattern_frame, text="×").grid(row=0, column=1, padx=2)
-        ttk.Entry(pattern_frame, textvariable=self.pattern_rows_var, width=5).grid(row=0, column=2)
+        
+        pattern_rows_entry = ttk.Entry(pattern_frame, textvariable=self.pattern_rows_var, width=5)
+        pattern_rows_entry.grid(row=0, column=2)
+        pattern_rows_entry.bind("<FocusOut>", lambda e: self.save_ui_config())
+        pattern_rows_entry.bind("<Return>", lambda e: self.save_ui_config())
         
         ttk.Label(calib_frame, text="方格尺寸 (mm):").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.square_size_var = tk.StringVar(value="15.0")
-        ttk.Entry(calib_frame, textvariable=self.square_size_var, width=10).grid(row=2, column=1, sticky=tk.W, pady=5)
+        square_size_entry = ttk.Entry(calib_frame, textvariable=self.square_size_var, width=10)
+        square_size_entry.grid(row=2, column=1, sticky=tk.W, pady=5)
+        square_size_entry.bind("<FocusOut>", lambda e: self.save_ui_config())
+        square_size_entry.bind("<Return>", lambda e: self.save_ui_config())
         
         ttk.Label(calib_frame, text="(例如: 9×6 表示9列6行内部角点)", 
                  font=("", 8), foreground="gray").grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
         
         # 检测棋盘格按钮
-        ttk.Button(calib_frame, text="检测棋盘格", command=self.detect_chessboard).grid(
-            row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        detection_button_frame = ttk.Frame(calib_frame)
+        detection_button_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.detect_chessboard_button = ttk.Button(detection_button_frame, text="检测棋盘格", command=self.detect_chessboard)
+        self.detect_chessboard_button.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        
+        self.cancel_detect_button = ttk.Button(detection_button_frame, text="取消", command=self.cancel_detection, state="disabled")
+        self.cancel_detect_button.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        
+        detection_button_frame.columnconfigure(0, weight=3)
+        detection_button_frame.columnconfigure(1, weight=1)
+        
+        # 检测状态标签
+        self.detection_status_label = ttk.Label(calib_frame, text="", foreground="blue")
+        self.detection_status_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
         
         # 标定按钮
-        ttk.Button(calib_frame, text="标定外参", command=self.calibrate_extrinsic).grid(
-            row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        calibration_button_frame = ttk.Frame(calib_frame)
+        calibration_button_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.calibrate_button = ttk.Button(calibration_button_frame, text="标定外参", command=self.calibrate_extrinsic)
+        self.calibrate_button.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 5))
+        
+        self.cancel_calibrate_button = ttk.Button(calibration_button_frame, text="取消", command=self.cancel_calibration, state="disabled")
+        self.cancel_calibrate_button.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        
+        calibration_button_frame.columnconfigure(0, weight=3)
+        calibration_button_frame.columnconfigure(1, weight=1)
+        
+        # 标定状态标签
+        self.calibration_status_label = ttk.Label(calib_frame, text="", foreground="blue")
+        self.calibration_status_label.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
         
         # 测试控制
         test_frame = ttk.LabelFrame(control_frame, text="测试外参", padding="10")
@@ -834,7 +890,12 @@ class CameraCalibrationUI:
         self.log("已清除所有点")
     
     def detect_chessboard(self):
-        """检测两个图像中的棋盘格"""
+        """检测两个图像中的棋盘格（在后台线程中执行）"""
+        # 检查是否正在检测
+        if self.detection_thread is not None and self.detection_thread.is_alive():
+            messagebox.showwarning("警告", "检测正在进行中，请等待完成或点击取消")
+            return
+        
         if self.image_3d is None or self.image_barcode is None:
             messagebox.showwarning("警告", "请先加载或采集两个相机的图像")
             return
@@ -844,49 +905,154 @@ class CameraCalibrationUI:
             pattern_cols = int(self.pattern_cols_var.get())
             pattern_rows = int(self.pattern_rows_var.get())
             pattern_size = (pattern_cols, pattern_rows)
-            
-            self.log(f"开始检测棋盘格，参数: {pattern_cols}×{pattern_rows}")
-            
-            # 检测3D相机图像中的棋盘格
-            ret1, corners1 = self.calibration.detect_chessboard(self.image_3d, pattern_size)
-            if ret1:
-                # 在显示图像上绘制检测到的角点（不修改原始图像）
-                img1_display = self.image_3d.copy()
-                # 使用自定义绘制，使点和线更粗更大（3D相机图像，点较小）
-                self._draw_chessboard_corners_custom(img1_display, pattern_size, corners1, is_barcode=False)
-                self.display_image_3d = img1_display
-                self._update_canvas(self.canvas_3d, img1_display)
-                self.log(f"3D相机图像: 检测到棋盘格，角点数: {len(corners1)}")
-            else:
-                self.log("3D相机图像: 未检测到棋盘格")
-                messagebox.showwarning("警告", "3D相机图像中未检测到棋盘格")
-                return
-            
-            # 检测读码器相机图像中的棋盘格
-            ret2, corners2 = self.calibration.detect_chessboard(self.image_barcode, pattern_size)
-            if ret2:
-                # 在显示图像上绘制检测到的角点（不修改原始图像）
-                img2_display = self.image_barcode.copy()
-                # 使用自定义绘制，使点和线更粗更大（读码器图像，点更大）
-                self._draw_chessboard_corners_custom(img2_display, pattern_size, corners2, is_barcode=True)
-                self.display_image_barcode = img2_display
-                self._update_canvas(self.canvas_barcode, img2_display)
-                self.log(f"读码器相机图像: 检测到棋盘格，角点数: {len(corners2)}")
-            else:
-                self.log("读码器相机图像: 未检测到棋盘格")
-                messagebox.showwarning("警告", "读码器相机图像中未检测到棋盘格")
-                return
-            
-            messagebox.showinfo("成功", "两个图像中都检测到棋盘格！\n可以点击'标定外参'进行标定")
-            
         except ValueError as e:
             messagebox.showerror("错误", f"棋盘格参数格式错误: {e}")
+            return
+        
+        # 重置取消标志
+        self.detection_cancel_flag.clear()
+        
+        # 准备检测参数
+        detect_params = {
+            'image_3d': self.image_3d.copy(),
+            'image_barcode': self.image_barcode.copy(),
+            'pattern_size': pattern_size,
+        }
+        
+        # 更新UI状态
+        self.detect_chessboard_button.config(state="disabled")
+        self.cancel_detect_button.config(state="normal")
+        self.detection_status_label.config(text="正在检测棋盘格...")
+        self.root.update_idletasks()  # 强制更新UI
+        self.log(f"开始检测棋盘格，参数: {pattern_cols}×{pattern_rows}")
+        
+        # 在后台线程中执行检测
+        self.detection_thread = threading.Thread(
+            target=self._detect_chessboard_thread,
+            args=(detect_params,),
+            daemon=True
+        )
+        self.detection_thread.start()
+    
+    def cancel_detection(self):
+        """取消检测"""
+        if self.detection_thread is not None and self.detection_thread.is_alive():
+            self.detection_cancel_flag.set()
+            self.log("正在取消检测...")
+    
+    def _detect_chessboard_thread(self, params):
+        """在后台线程中执行棋盘格检测"""
+        try:
+            # 更新状态：检测第一个图像
+            self.root.after(0, self._update_detection_status, "正在检测3D相机图像...")
+            
+            # 检测3D相机图像中的棋盘格
+            ret1, corners1 = self.calibration.detect_chessboard(
+                params['image_3d'], params['pattern_size']
+            )
+            
+            if self.detection_cancel_flag.is_set():
+                self.root.after(0, self._on_detection_cancelled)
+                return
+            
+            if not ret1:
+                self.root.after(0, self._on_detection_complete, False, 
+                              "3D相机图像中未检测到棋盘格", None, None)
+                return
+            
+            # 更新状态：检测第二个图像
+            self.root.after(0, self._update_detection_status, "正在检测读码器相机图像...")
+            
+            # 检测读码器相机图像中的棋盘格
+            ret2, corners2 = self.calibration.detect_chessboard(
+                params['image_barcode'], params['pattern_size']
+            )
+            
+            if self.detection_cancel_flag.is_set():
+                self.root.after(0, self._on_detection_cancelled)
+                return
+            
+            if not ret2:
+                self.root.after(0, self._on_detection_complete, False,
+                              "读码器相机图像中未检测到棋盘格", corners1, None)
+                return
+            
+            # 在主线程中更新UI
+            self.root.after(0, self._on_detection_complete, True, 
+                          "两个图像中都检测到棋盘格！", corners1, corners2)
+            
         except Exception as e:
-            messagebox.showerror("错误", f"检测棋盘格失败: {e}")
-            self.log(f"检测失败: {e}")
+            # 在主线程中显示错误
+            self.root.after(0, self._on_detection_error, str(e))
+    
+    def _update_detection_status(self, status_text):
+        """更新检测状态显示"""
+        self.detection_status_label.config(text=status_text)
+        self.log(status_text)
+    
+    def _on_detection_complete(self, success, msg, corners1, corners2):
+        """检测完成回调（在主线程中执行）"""
+        # 清除状态标签
+        self.detection_status_label.config(text="")
+        
+        # 恢复按钮状态
+        self.detect_chessboard_button.config(state="normal")
+        self.cancel_detect_button.config(state="disabled")
+        
+        if success and corners1 is not None and corners2 is not None:
+            # 绘制检测到的角点
+            pattern_size = (int(self.pattern_cols_var.get()), int(self.pattern_rows_var.get()))
+            
+            # 3D相机图像
+            img1_display = self.image_3d.copy()
+            self._draw_chessboard_corners_custom(img1_display, pattern_size, corners1, is_barcode=False)
+            self.display_image_3d = img1_display
+            self._update_canvas(self.canvas_3d, img1_display)
+            self.log(f"3D相机图像: 检测到棋盘格，角点数: {len(corners1)}")
+            
+            # 读码器相机图像
+            img2_display = self.image_barcode.copy()
+            self._draw_chessboard_corners_custom(img2_display, pattern_size, corners2, is_barcode=True)
+            self.display_image_barcode = img2_display
+            self._update_canvas(self.canvas_barcode, img2_display)
+            self.log(f"读码器相机图像: 检测到棋盘格，角点数: {len(corners2)}")
+            
+            self.log(msg)
+            messagebox.showinfo("成功", f"{msg}\n可以点击'标定外参'进行标定")
+        else:
+            self.log(f"检测失败: {msg}")
+            messagebox.showwarning("警告", msg)
+    
+    def _on_detection_cancelled(self):
+        """检测取消回调（在主线程中执行）"""
+        # 清除状态标签
+        self.detection_status_label.config(text="")
+        
+        # 恢复按钮状态
+        self.detect_chessboard_button.config(state="normal")
+        self.cancel_detect_button.config(state="disabled")
+        
+        self.log("检测已取消")
+    
+    def _on_detection_error(self, error_msg):
+        """检测出错回调（在主线程中执行）"""
+        # 清除状态标签
+        self.detection_status_label.config(text="")
+        
+        # 恢复按钮状态
+        self.detect_chessboard_button.config(state="normal")
+        self.cancel_detect_button.config(state="disabled")
+        
+        self.log(f"检测过程出错: {error_msg}")
+        messagebox.showerror("错误", f"检测过程出错！\n{error_msg}")
     
     def calibrate_extrinsic(self):
-        """使用棋盘格标定外参"""
+        """使用棋盘格标定外参（在后台线程中执行）"""
+        # 检查是否正在标定
+        if self.calibration_thread is not None and self.calibration_thread.is_alive():
+            messagebox.showwarning("警告", "标定正在进行中，请等待完成或点击取消")
+            return
+        
         # 检查是否有两个相机的图像
         if self.image_3d is None:
             messagebox.showwarning("警告", "请先连接3D相机或加载3D相机图像")
@@ -964,15 +1130,78 @@ class CameraCalibrationUI:
                     camera2_matrix = camera2_matrix.reshape(3, 3)
                     self.log("相机2内参矩阵已从1D数组reshape为3x3")
         
-        # 执行棋盘格标定
+        # 重置取消标志
+        self.calibration_cancel_flag.clear()
+        
+        # 准备标定参数
+        calib_params = {
+            'image_3d': self.image_3d.copy(),
+            'image_barcode': self.image_barcode.copy(),
+            'pattern_size': pattern_size,
+            'square_size': square_size,
+            'camera1_matrix': camera1_matrix,
+            'camera2_matrix': camera2_matrix,
+            'camera1_distortion': camera1_distortion,
+            'camera2_distortion': camera2_distortion,
+        }
+        
+        # 更新UI状态
+        self.calibrate_button.config(state="disabled")
+        self.cancel_calibrate_button.config(state="normal")
+        self.calibration_status_label.config(text="准备标定...")
+        self.root.update_idletasks()  # 强制更新UI
         self.log(f"开始棋盘格标定，参数: {pattern_cols}×{pattern_rows}, 方格尺寸: {square_size}mm")
         
-        success, msg = self.calibration.calibrate_with_chessboard(
-            self.image_3d, self.image_barcode,
-            pattern_size, square_size,
-            camera1_matrix, camera2_matrix,
-            camera1_distortion, camera2_distortion
+        # 在后台线程中执行标定
+        self.calibration_thread = threading.Thread(
+            target=self._calibrate_extrinsic_thread,
+            args=(calib_params,),
+            daemon=True
         )
+        self.calibration_thread.start()
+    
+    def cancel_calibration(self):
+        """取消标定"""
+        if self.calibration_thread is not None and self.calibration_thread.is_alive():
+            self.calibration_cancel_flag.set()
+            self.log("正在取消标定...")
+            # 注意：OpenCV的标定函数无法直接中断，只能等待它完成
+            # 这里设置标志，线程完成后会检查并报告
+    
+    def _calibrate_extrinsic_thread(self, params):
+        """在后台线程中执行标定"""
+        try:
+            # 更新状态：检测角点
+            self.root.after(0, self._update_calibration_status, "正在检测棋盘格角点...")
+            
+            # 执行棋盘格标定
+            success, msg = self.calibration.calibrate_with_chessboard(
+                params['image_3d'], params['image_barcode'],
+                params['pattern_size'], params['square_size'],
+                params['camera1_matrix'], params['camera2_matrix'],
+                params['camera1_distortion'], params['camera2_distortion']
+            )
+            
+            # 在主线程中更新UI
+            self.root.after(0, self._on_calibration_complete, success, msg)
+            
+        except Exception as e:
+            # 在主线程中显示错误
+            self.root.after(0, self._on_calibration_error, str(e))
+    
+    def _update_calibration_status(self, status_text):
+        """更新标定状态显示"""
+        self.calibration_status_label.config(text=status_text)
+        self.log(status_text)
+    
+    def _on_calibration_complete(self, success, msg):
+        """标定完成回调（在主线程中执行）"""
+        # 清除状态标签
+        self.calibration_status_label.config(text="")
+        
+        # 恢复按钮状态
+        self.calibrate_button.config(state="normal")
+        self.cancel_calibrate_button.config(state="disabled")
         
         if success:
             self.log(f"标定成功: {msg}")
@@ -1006,6 +1235,18 @@ class CameraCalibrationUI:
         else:
             self.log(f"标定失败: {msg}")
             messagebox.showerror("失败", f"外参标定失败！\n{msg}")
+    
+    def _on_calibration_error(self, error_msg):
+        """标定出错回调（在主线程中执行）"""
+        # 清除状态标签
+        self.calibration_status_label.config(text="")
+        
+        # 恢复按钮状态
+        self.calibrate_button.config(state="normal")
+        self.cancel_calibrate_button.config(state="disabled")
+        
+        self.log(f"标定过程出错: {error_msg}")
+        messagebox.showerror("错误", f"标定过程出错！\n{error_msg}")
     
     def load_calibration(self):
         """加载标定参数"""
@@ -1063,11 +1304,25 @@ class CameraCalibrationUI:
                 self.log(f"标定参数保存失败: {file_path}")
 
     def _get_device_ip(self) -> Optional[str]:
+        """获取设备IP地址，优先使用读码器相机的IP"""
+        # 如果手动输入了设备IP，优先使用
         ip = self.device_ip_var.get().strip()
-        if not ip:
-            messagebox.showwarning("警告", "请输入设备IP地址")
-            return None
-        return ip
+        if ip:
+            return ip
+        
+        # 如果没有输入，使用读码器相机的IP
+        if self.camera_barcode and self.camera_barcode.connected:
+            ip = self.camera_barcode.ip
+            if ip:
+                return ip
+        
+        # 如果读码器相机未连接，尝试从配置中获取
+        ip = self.ip_barcode_var.get().strip()
+        if ip:
+            return ip
+        
+        messagebox.showwarning("警告", "请连接读码器相机或输入设备IP地址")
+        return None
 
     def _get_device_path(self, file_name: str) -> str:
         return f"{DEVICE_BASE_DIR}/{file_name}"
@@ -1077,6 +1332,12 @@ class CameraCalibrationUI:
         ip = self._get_device_ip()
         if not ip:
             return
+        
+        # 同步更新UI上的设备IP显示
+        if not self.device_ip_var.get().strip():
+            # 如果设备IP输入框为空，自动填入使用的IP
+            self.device_ip_var.set(ip)
+            self.log(f"已自动设置设备IP为: {ip}")
         
         local_path = filedialog.askopenfilename(
             title="选择要上传的标定文件",
@@ -1138,6 +1399,12 @@ class CameraCalibrationUI:
         ip = self._get_device_ip()
         if not ip:
             return
+        
+        # 同步更新UI上的设备IP显示
+        if not self.device_ip_var.get().strip():
+            # 如果设备IP输入框为空，自动填入使用的IP
+            self.device_ip_var.set(ip)
+            self.log(f"已自动设置设备IP为: {ip}")
         
         local_path = filedialog.asksaveasfilename(
             title="保存下载的标定文件",
